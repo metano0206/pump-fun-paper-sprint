@@ -1,309 +1,293 @@
-"""Momentum + volume-confirmation paper-trading bot for pump.fun replays.
+"""Paper-trading bot for the make.fun pump.fun replay sprint.
 
-Strategy (written for the make.fun pumpfun-replay/v2 harness):
+The idea in one paragraph: a coin is only worth buying when the tape
+agrees with the chart. For every mint the harness shows us we remember
+the last few minutes of trades (who bought, who sold, how much) and a
+trail of prices implied by the bonding-curve reserves. A full-size
+entry needs all of it at once -- a busy window, buyers clearly in
+control of the volume, several different wallets on the buy side, a
+double-digit price rise over the lookback, and deep enough real
+reserves that getting out later is realistic. Anything less is
+ignored, except for a smaller "scout" ticket that keeps the required
+rotation of finished round trips on schedule when it falls behind.
 
-- Watch every bonding curve the harness shows us and keep, per mint, a
-  rolling window of recent trades (slot, direction, size, trader) plus a
-  short price history taken from the curve reserves.
-- Enter only when several signs agree inside the window: enough trades,
-  buy volume clearly dominating sell volume, several distinct buyers, the
-  price up over the lookback, and enough real reserves that the position
-  can be exited again. This is the "momentum with volume confirmation"
-  pattern: a rising price alone is not trusted.
-- Keep positions small and few (at most 4 open, about 0.06 SOL each
-  against 10 SOL of paper capital), so the worst realistic drawdown
-  stays far below the harness's 50% guardrail.
-- Exit on rules, not hope: take profit at +35%, stop at -18%, a trailing
-  stop once a position has been up 15% (sell if it gives back 12 points),
-  and a hard maximum holding time. Exits are decided before entries on
-  every batch.
-- Rotate: after selling a mint it goes on cooldown, and if completed
-  round trips fall behind the pace the guardrail needs (20 distinct
-  mints), a smaller "scout" stake is allowed on weaker signals so the
-  rotation keeps moving.
-
-Everything is a deterministic function of the batches seen so far: no
-randomness, no wall clock, no iteration over unordered sets when making
-decisions (candidates are always sorted first).
+Positions stay deliberately small against the 10 SOL of paper capital
+and never number more than four, which keeps the worst plausible
+drawdown nowhere near the 50% disqualification line. Sales are pure
+bookkeeping: fixed take-profit and stop-loss levels, a ceiling on how
+long anything may be held, and a resting period for a mint once it has
+been sold. A trailing stop guards the winners: once a holding has
+marked +15% it is sold if it later falls 10 points from its best mark.
+Every decision is a deterministic function of the batches received so
+far -- no clock, no randomness, and candidates are always sorted
+before any order is placed.
 """
 
 import os
 import sys
 from collections import deque
 
+# The grader starts the bot with -P, so the script's own directory is
+# missing from sys.path; add the vendored SDK by hand.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
 import makefun_bot  # noqa: E402
 
-SOL = makefun_bot.LAMPORTS_PER_SOL
+LAMPORTS = makefun_bot.LAMPORTS_PER_SOL
 
-# --- sizing -------------------------------------------------------------
-STAKE_LAMPORTS = 60_000_000          # 0.06 SOL per full position
-SCOUT_STAKE_LAMPORTS = 25_000_000    # 0.025 SOL per scout position
-MIN_BUY_LAMPORTS = 12_000_000        # never open dust (guardrail wants >= 0.01 SOL trips)
-MAX_POSITIONS = 4                    # harness cap is 5; keep one slot of headroom
-MIN_REAL_QUOTE = 6 * SOL             # need >= 6 SOL real reserves so the 1% cap fits a stake
+# ---- ticket sizes -------------------------------------------------------
+FULL_TICKET = 60_000_000       # 0.06 SOL for a full-strength signal
+SCOUT_TICKET = 25_000_000      # 0.025 SOL for a rotation scout
+SMALLEST_BUY = 12_000_000      # a round trip only counts from 0.01 SOL up
+OPEN_LIMIT = 4                 # the harness allows 5; leave headroom
+RESERVE_FLOOR = 6 * LAMPORTS   # 1% of real reserves must cover a ticket
 
-# --- entry signal ---------------------------------------------------------
-WINDOW_SLOTS = 750                   # rolling trade window (~5 minutes of slots)
-LOOKBACK_SLOTS = 250                 # price momentum lookback (~100 seconds)
-MIN_TRADES = 20
-MIN_UNIQUE_BUYERS = 6
-MIN_BUY_SHARE = 0.70                 # buy volume / total volume inside the window
-MIN_PRICE_GAIN = 0.10                # +10% over the lookback
+# ---- what a full entry must show ----------------------------------------
+TAPE_SPAN = 750                # slots of trade history kept per mint
+GAIN_SPAN = 250                # slots over which the price rise is read
+FULL_MIN_TRADES = 20
+FULL_MIN_BUYERS = 6
+FULL_MIN_BUY_SHARE = 0.70
+FULL_MIN_GAIN = 0.10
 SCOUT_MIN_TRADES = 5
 SCOUT_MIN_BUY_SHARE = 0.58
-SCOUT_MIN_PRICE_GAIN = 0.03
+SCOUT_MIN_GAIN = 0.03
 
-# --- exits ----------------------------------------------------------------
-TAKE_PROFIT = 0.35
-STOP_LOSS = -0.12
-TRAIL_ARM = 0.15                     # trailing stop arms at +15%
-TRAIL_GIVEBACK = 0.10                # ...and fires after giving back 10 points
-MAX_HOLD_SLOTS = 6000                # ~40 minutes, then rotate out
-COOLDOWN_SLOTS = 3000                # a sold mint rests before it can be re-entered
+# ---- selling rules --------------------------------------------------------
+PROFIT_TARGET = 0.35           # bank a position at +35%
+LOSS_CUT = -0.12               # abandon it at -12%
+TRAIL_ARM = 0.15               # trailing stop wakes up at +15%
+TRAIL_DROP = 0.10              # ...and sells 10 points below the best mark
+HOLD_LIMIT = 6000              # slots; after this, rotate out regardless
+REST_SLOTS = 3000              # a sold mint sits out this long
 
-# --- risk -----------------------------------------------------------------
-DRAWDOWN_PAUSE = 0.25                # stop opening if equity is 25% under its peak
-PACE_SLOTS_PER_TRIP = 2000           # want one finished round trip per this many slots
+# ---- brakes -----------------------------------------------------------------
+EQUITY_DIP = 0.25              # scout flow pauses 25% under the equity peak
+SLOTS_PER_TRIP = 2000          # target rhythm for finished round trips
 
-BUY_SLIPPAGE_BPS = 1200
-SELL_SLIPPAGE_BPS = 2000
+BUY_SLIP_BPS = 1200
+SELL_SLIP_BPS = 2000
 
-# --- rolling per-mint state -------------------------------------------------
-trades = {}        # mint -> deque of (slot, is_buy, sol_amount, user)
-price_hist = {}    # mint -> deque of (slot, price as float)
-first_slot = None  # slot of the first batch seen (for pacing)
-peak_value = {}    # mint -> best gross value ratio seen while held (for trailing)
-entry_slot = {}    # mint -> slot the position was first seen held
-bought_size = {}   # mint -> largest buy quote_lamports we sent for it
-tripped = set()    # mints with a completed round trip (only counted, never iterated)
-cooldown_until = {}  # mint -> slot until which re-entry is blocked
+# ---- memory -------------------------------------------------------------------
+tape = {}          # mint -> deque[(slot, bought, sol_amount, wallet)]
+marks = {}         # mint -> deque[(slot, price)]
+opened_at = {}     # mint -> slot where the current holding was first seen
+best_ratio = {}    # mint -> best value/cost ratio marked while held
+biggest_buy = {}   # mint -> largest quote we have sent for it
+trips_done = set() # mints whose round trip is finished (counted only)
+resting_until = {} # mint -> first slot at which it may be bought again
+run_start = [None] # slot of the first batch of the run
+equity_peak = [0]  # best mark-to-market equity seen so far
 
 
-def price_of(curve):
+def spot_price(curve):
+    """Price implied by a curve's virtual reserves, or None if unusable."""
     if curve is None or curve.virtual_token_reserves <= 0:
         return None
     return curve.virtual_quote_reserves / curve.virtual_token_reserves
 
 
-def note_events(state, batch):
-    """Fold this batch's raw events into the rolling windows."""
-    slot = state.slot
-    for e in batch["events"]:
-        mint = e["mint"]
-        if e["event"] == "TradeEvent":
-            dq = trades.get(mint)
-            if dq is None:
-                dq = trades[mint] = deque()
-            dq.append((slot, bool(e.get("is_buy")), int(e.get("sol_amount", 0)), e.get("user", "")))
-        curve = state.curves.get(mint)
-        p = price_of(curve)
-        if p is not None:
-            dq = price_hist.get(mint)
-            if dq is None:
-                dq = price_hist[mint] = deque()
-            if not dq or dq[-1][0] != slot:
-                dq.append((slot, p))
-    # Trim windows so memory stays bounded over long replays.
-    cutoff = slot - WINDOW_SLOTS
-    for dq in trades.values():
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
-    pcut = slot - max(WINDOW_SLOTS, LOOKBACK_SLOTS) - 5
-    for dq in price_hist.values():
-        while len(dq) > 1 and dq[0][0] < pcut:
-            dq.popleft()
+def absorb_batch(state, batch):
+    """Record this batch's events into the tape and the price trails."""
+    here = state.slot
+    for event in batch["events"]:
+        mint = event["mint"]
+        if event["event"] == "TradeEvent":
+            window = tape.setdefault(mint, deque())
+            window.append(
+                (here, bool(event.get("is_buy")),
+                 int(event.get("sol_amount", 0)), event.get("user", ""))
+            )
+        price = spot_price(state.curves.get(mint))
+        if price is not None:
+            trail = marks.setdefault(mint, deque())
+            if not trail or trail[-1][0] != here:
+                trail.append((here, price))
+    # Keep the windows from growing without bound on long replays.
+    tape_floor = here - TAPE_SPAN
+    for window in tape.values():
+        while window and window[0][0] < tape_floor:
+            window.popleft()
+    mark_floor = here - max(TAPE_SPAN, GAIN_SPAN) - 5
+    for trail in marks.values():
+        while len(trail) > 1 and trail[0][0] < mark_floor:
+            trail.popleft()
 
 
-def window_stats(mint):
-    """(trade count, buy share, unique buyers) inside the rolling window."""
-    dq = trades.get(mint)
-    if not dq:
+def tape_summary(mint):
+    """(number of trades, buy share of volume, distinct buyers) on the tape."""
+    window = tape.get(mint)
+    if not window:
         return 0, 0.0, 0
-    buy_vol = 0
-    sell_vol = 0
-    buyers = set()
-    for _slot, is_buy, amount, user in dq:
+    bought = sold = 0
+    wallets = set()
+    for _slot, is_buy, amount, wallet in window:
         if is_buy:
-            buy_vol += amount
-            buyers.add(user)
+            bought += amount
+            wallets.add(wallet)
         else:
-            sell_vol += amount
-    total = buy_vol + sell_vol
-    share = (buy_vol / total) if total > 0 else 0.0
-    return len(dq), share, len(buyers)
+            sold += amount
+    both = bought + sold
+    return len(window), (bought / both if both else 0.0), len(wallets)
 
 
-def price_gain(mint):
-    """Price change over the lookback, or None when there is not enough history."""
-    dq = price_hist.get(mint)
-    if not dq or len(dq) < 2:
+def recent_gain(mint):
+    """Price change across the lookback span, or None without the history."""
+    trail = marks.get(mint)
+    if not trail or len(trail) < 2:
         return None
-    now_slot, now_price = dq[-1]
-    target = now_slot - LOOKBACK_SLOTS
-    old_price = None
-    for slot, price in dq:
-        if slot <= target:
-            old_price = price
-        else:
+    last_slot, last_price = trail[-1]
+    wanted = last_slot - GAIN_SPAN
+    base = None
+    for slot, price in trail:
+        if slot > wanted:
             break
-    if old_price is None or old_price <= 0:
+        base = price
+    if not base:
         return None
-    return now_price / old_price - 1.0
+    return last_price / base - 1.0
 
 
-def pending_mints(state, side):
-    out = set()
-    for p in state.pending.values():
-        if p.order["side"] == side:
-            out.add(p.order["mint"])
-    return out
+def mints_with_pending(state, side):
+    found = set()
+    for pending in state.pending.values():
+        if pending.order["side"] == side:
+            found.add(pending.order["mint"])
+    return found
 
 
-def equity_marks(state):
-    """Cash plus open positions valued at the latest curve price."""
+def marked_equity(state):
+    """Cash plus holdings priced at the newest curve marks."""
     total = state.cash
-    for mint, h in state.positions.items():
-        p = price_of(state.curves.get(mint))
-        if p is not None:
-            total += int(h.token_amount * p)
+    for mint, holding in state.positions.items():
+        price = spot_price(state.curves.get(mint))
+        if price is not None:
+            total += int(holding.token_amount * price)
     return total
 
 
-peak_equity = [0]
-
-
-def plan_exits(state, orders):
-    """Rule-based exits for everything currently held. Returns mints being sold."""
-    selling = []
-    pending_sells = pending_mints(state, "sell")
+def choose_sales(state, orders):
+    """Apply the fixed selling rules to everything held; returns sold mints."""
+    already = mints_with_pending(state, "sell")
+    sold = []
     for mint in sorted(state.positions):
-        if mint in pending_sells:
+        if mint in already:
             continue
-        h = state.positions[mint]
+        holding = state.positions[mint]
         curve = state.curves.get(mint)
-        if mint not in entry_slot:
-            entry_slot[mint] = state.slot
+        opened_at.setdefault(mint, state.slot)
         if curve is not None and curve.complete:
-            continue  # the replay closes completed curves itself
-        p = price_of(curve)
-        if p is None or h.cost_lamports <= 0:
+            continue  # the harness settles finished curves itself
+        price = spot_price(curve)
+        if price is None or holding.cost_lamports <= 0:
             continue
-        value = h.token_amount * p
-        ratio = value / h.cost_lamports
-        best = peak_value.get(mint, ratio)
+        ratio = holding.token_amount * price / holding.cost_lamports
+        gain = ratio - 1.0
+        best = best_ratio.get(mint, ratio)
         if ratio > best:
-            best = peak_value[mint] = ratio
-        held_for = state.slot - entry_slot[mint]
-        reason = None
-        if ratio - 1.0 >= TAKE_PROFIT:
-            reason = "take profit"
-        elif ratio - 1.0 <= STOP_LOSS:
-            reason = "stop loss"
-        elif best - 1.0 >= TRAIL_ARM and ratio <= best - TRAIL_GIVEBACK:
-            reason = "trailing stop"
-        elif held_for >= MAX_HOLD_SLOTS:
-            reason = "time rotation"
-        if reason is None:
-            continue
-        orders.append({
-            "side": "sell",
-            "mint": mint,
-            "token_amount": h.token_amount,
-            "max_slippage_bps": SELL_SLIPPAGE_BPS,
-        })
-        selling.append(mint)
-    return selling
+            best = best_ratio[mint] = ratio
+        age = state.slot - opened_at[mint]
+        trailed = best - 1.0 >= TRAIL_ARM and ratio <= best - TRAIL_DROP
+        if gain >= PROFIT_TARGET or gain <= LOSS_CUT or trailed or age >= HOLD_LIMIT:
+            orders.append({
+                "side": "sell",
+                "mint": mint,
+                "token_amount": holding.token_amount,
+                "max_slippage_bps": SELL_SLIP_BPS,
+            })
+            sold.append(mint)
+    return sold
 
 
-def plan_entries(state, orders, selling):
+def choose_buys(state, orders, being_sold):
     caps = state.hello["caps"]
-    tx = state.tx_fee_lamports()
-    free = state.free_cash_lamports()
-    held = set(state.positions) | pending_mints(state, "buy") | set(selling)
-    open_slots = MAX_POSITIONS - len(held & (set(state.positions) | pending_mints(state, "buy")))
-    if open_slots <= 0:
+    fee = state.tx_fee_lamports()
+    spendable = state.free_cash_lamports()
+    busy = set(state.positions) | mints_with_pending(state, "buy")
+    room = OPEN_LIMIT - len(busy)
+    if room <= 0:
         return
-    # Pacing: how many round trips should be done by now?
-    elapsed = max(0, state.slot - (first_slot or state.slot))
-    trips_wanted = elapsed // PACE_SLOTS_PER_TRIP
-    behind_pace = len(tripped) + 2 < trips_wanted
-    # Drawdown guard: pause new entries while equity is well under its peak.
-    eq = equity_marks(state)
-    if eq > peak_equity[0]:
-        peak_equity[0] = eq
-    paused = peak_equity[0] > 0 and eq < peak_equity[0] * (1.0 - DRAWDOWN_PAUSE)
+    blocked = busy | set(being_sold) | mints_with_pending(state, "sell")
 
-    candidates = []
+    # Rotation pacing: one finished trip per SLOTS_PER_TRIP slots.
+    elapsed = max(0, state.slot - (run_start[0] or state.slot))
+    trips_due = elapsed // SLOTS_PER_TRIP
+    lagging = len(trips_done) + 2 < trips_due
+
+    # Equity brake: while the account marks well under its best level,
+    # the weaker scout flow is switched off (full signals still trade).
+    equity = marked_equity(state)
+    if equity > equity_peak[0]:
+        equity_peak[0] = equity
+    braking = equity_peak[0] > 0 and equity < equity_peak[0] * (1.0 - EQUITY_DIP)
+
+    scored = []
     for mint in sorted(state.curves):
-        if mint in held or mint in pending_mints(state, "sell"):
-            continue
-        if state.slot < cooldown_until.get(mint, -1):
+        if mint in blocked or state.slot < resting_until.get(mint, -1):
             continue
         curve = state.curves[mint]
-        if curve.complete or curve.real_quote_reserves < MIN_REAL_QUOTE:
+        if curve.complete or curve.real_quote_reserves < RESERVE_FLOOR:
             continue
-        count, share, buyers = window_stats(mint)
-        gain = price_gain(mint)
+        trades_n, share, buyers = tape_summary(mint)
+        gain = recent_gain(mint)
         if gain is None:
             continue
-        strong = (
-            count >= MIN_TRADES and share >= MIN_BUY_SHARE
-            and buyers >= MIN_UNIQUE_BUYERS and gain >= MIN_PRICE_GAIN
+        full = (
+            trades_n >= FULL_MIN_TRADES and share >= FULL_MIN_BUY_SHARE
+            and buyers >= FULL_MIN_BUYERS and gain >= FULL_MIN_GAIN
         )
         scout = (
-            behind_pace and count >= SCOUT_MIN_TRADES
-            and share >= SCOUT_MIN_BUY_SHARE and gain >= SCOUT_MIN_PRICE_GAIN
+            lagging and not braking
+            and trades_n >= SCOUT_MIN_TRADES and share >= SCOUT_MIN_BUY_SHARE
+            and gain >= SCOUT_MIN_GAIN
         )
-        if strong:
-            candidates.append((0, -gain, -share, mint))
-        elif scout and not paused:
-            candidates.append((1, -gain, -share, mint))
-    candidates.sort()
-    for _kind, _ng, _ns, mint in candidates:
-        if open_slots <= 0 or len(orders) >= caps["max_orders_per_batch"]:
+        if full:
+            scored.append((0, -gain, -share, mint))
+        elif scout:
+            scored.append((1, -gain, -share, mint))
+    scored.sort()
+    for kind, _neg_gain, _neg_share, mint in scored:
+        if room <= 0 or len(orders) >= caps["max_orders_per_batch"]:
             break
-        stake = STAKE_LAMPORTS if _kind == 0 else SCOUT_STAKE_LAMPORTS
-        cap = state.max_buy_lamports(mint)
-        amount = min(stake, cap)
-        if amount < MIN_BUY_LAMPORTS or free < amount + tx:
+        ticket = FULL_TICKET if kind == 0 else SCOUT_TICKET
+        amount = min(ticket, state.max_buy_lamports(mint))
+        if amount < SMALLEST_BUY or spendable < amount + fee:
             continue
         orders.append({
             "side": "buy",
             "mint": mint,
             "quote_lamports": amount,
-            "max_slippage_bps": BUY_SLIPPAGE_BPS,
+            "max_slippage_bps": BUY_SLIP_BPS,
         })
-        bought_size[mint] = max(bought_size.get(mint, 0), amount)
-        free -= amount + tx
-        open_slots -= 1
+        biggest_buy[mint] = max(biggest_buy.get(mint, 0), amount)
+        spendable -= amount + fee
+        room -= 1
 
 
-def note_departed_positions(state, before):
-    """Mints held last batch and gone now finished a round trip somehow."""
-    for mint in before:
-        if mint not in state.positions:
-            if bought_size.get(mint, 0) >= MIN_BUY_LAMPORTS:
-                tripped.add(mint)
-            cooldown_until[mint] = state.slot + COOLDOWN_SLOTS
-            peak_value.pop(mint, None)
-            entry_slot.pop(mint, None)
+def settle_departed(state, held_before):
+    """Holdings that vanished since the last batch close a round trip."""
+    for mint in held_before:
+        if mint in state.positions:
+            continue
+        if biggest_buy.get(mint, 0) >= SMALLEST_BUY:
+            trips_done.add(mint)
+        resting_until[mint] = state.slot + REST_SLOTS
+        opened_at.pop(mint, None)
+        best_ratio.pop(mint, None)
 
 
-_prev_positions = [set()]
+_held_before = [set()]
 
 
 def on_batch(state, batch):
-    global first_slot
-    if first_slot is None:
-        first_slot = state.slot
-    note_departed_positions(state, _prev_positions[0])
-    note_events(state, batch)
+    if run_start[0] is None:
+        run_start[0] = state.slot
+    settle_departed(state, _held_before[0])
+    absorb_batch(state, batch)
     orders = []
-    selling = plan_exits(state, orders)
-    plan_entries(state, orders, selling)
-    _prev_positions[0] = set(state.positions)
+    selling = choose_sales(state, orders)
+    choose_buys(state, orders, selling)
+    _held_before[0] = set(state.positions)
     return orders
 
 
